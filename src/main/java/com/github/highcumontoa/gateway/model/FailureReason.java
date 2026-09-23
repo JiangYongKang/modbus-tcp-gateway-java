@@ -1,0 +1,19 @@
+package com.github.highcumontoa.gateway.model;
+
+public enum FailureReason {
+    CONFIG_ERROR,
+    FRAMING_ERROR,
+    PROTOCOL_ERROR,
+    TRANSACTION_MISMATCH,
+    UNIT_MISMATCH,
+    FUNCTION_MISMATCH,
+    MALFORMED_RESPONSE,
+    MODBUS_EXCEPTION,
+    TIMEOUT,
+    CONNECTION_CLOSED,
+    CONNECTION_FAILED,
+    DECODE_ERROR,
+    OUT_OF_RANGE,
+    CANCELLED,
+    UNKNOWN
+}

@@ -1,0 +1,68 @@
+server:
+  port: 18080
+
+gateway:
+  client:
+    host: 127.0.0.1
+    port: 15020
+    connect-timeout-ms: 500
+    response-timeout-ms: 500
+    poll-interval-ms: 200
+    reconnect-delay-ms: 200
+    stale-threshold-ms: 1000
+  local-source:
+    enabled: true
+    host: 127.0.0.1
+    port: 15020
+    accept-backlog: 50
+  points:
+    - name: temperature-c
+      register-type: HOLDING
+      unit-id: 1
+      address: 0
+      data-type: INT16
+      scale: 0.1
+      min: 0
+      max: 200
+    - name: device-count
+      register-type: HOLDING
+      unit-id: 1
+      address: 1
+      data-type: UINT32
+    - name: pressure-bar
+      register-type: HOLDING
+      unit-id: 1
+      address: 3
+      data-type: FLOAT32
+    - name: pressure-low-word-first
+      register-type: HOLDING
+      unit-id: 1
+      address: 13
+      data-type: FLOAT32
+      word-order: LOW_WORD_FIRST
+    - name: signed-offset
+      register-type: HOLDING
+      unit-id: 1
+      address: 5
+      data-type: INT16
+    - name: input-raw
+      register-type: INPUT
+      unit-id: 1
+      address: 0
+      data-type: UINT16
+    - name: input-count
+      register-type: INPUT
+      unit-id: 1
+      address: 1
+      data-type: UINT32
+    - name: mixed-endian-float
+      register-type: HOLDING
+      unit-id: 1
+      address: 15
+      data-type: FLOAT32
+      byte-order: LITTLE_ENDIAN
+      word-order: LOW_WORD_FIRST
+
+logging:
+  level:
+    com.github.highcumontoa.gateway: INFO

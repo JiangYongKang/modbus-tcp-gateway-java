@@ -1,6 +1,9 @@
 package com.github.highcumontoa.gateway.simulator;
 
 import com.github.highcumontoa.gateway.config.GatewayProperties;
+import com.github.highcumontoa.gateway.fault.FaultRegistry;
+import com.github.highcumontoa.gateway.fault.FaultSpec;
+import com.github.highcumontoa.gateway.model.RegisterType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
@@ -23,6 +26,8 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
     private static final int REGISTER_BANK_SIZE = 64;
 
     private final GatewayProperties properties;
+    private final FaultRegistry faultRegistry;
+    private final Object registerLock = new Object();
     private final int[] holdingRegisters = initialHoldingRegisters();
     private final int[] inputRegisters = initialInputRegisters();
     private final ExecutorService connectionWorkers = Executors.newCachedThreadPool(runnable -> {
@@ -34,8 +39,9 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
     private volatile Thread acceptThread;
     private volatile boolean running;
 
-    public LocalModbusDeviceServer(GatewayProperties properties) {
+    public LocalModbusDeviceServer(GatewayProperties properties, FaultRegistry faultRegistry) {
         this.properties = properties;
+        this.faultRegistry = faultRegistry;
     }
 
     @Override
@@ -160,6 +166,23 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
             return;
         }
 
+        RegisterType registerType = functionCode == 3 ? RegisterType.HOLDING : RegisterType.INPUT;
+        var fault = faultRegistry.claim(registerType, startAddress, quantity);
+        if (fault.isPresent()) {
+            applyFault(fault.get(), output, transactionId, unitId, functionCode,
+                    buildResponseLocked(transactionId, unitId, functionCode, bank, startAddress, quantity));
+            return;
+        }
+
+        byte[] response = buildResponseLocked(transactionId, unitId, functionCode, bank, startAddress, quantity);
+        synchronized (output) {
+            output.write(response);
+            output.flush();
+        }
+    }
+
+    private static byte[] buildResponse(int transactionId, int unitId, int functionCode,
+                                        int[] bank, int startAddress, int quantity) {
         int pduLength = 2 + quantity * 2;
         byte[] response = new byte[7 + pduLength];
         writeUnsignedShort(response, 0, transactionId);
@@ -171,9 +194,118 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
         for (int i = 0; i < quantity; i++) {
             writeUnsignedShort(response, 9 + i * 2, bank[startAddress + i]);
         }
-        synchronized (output) {
-            output.write(response);
-            output.flush();
+        return response;
+    }
+
+    private byte[] buildResponseLocked(int transactionId, int unitId, int functionCode,
+                                       int[] bank, int startAddress, int quantity) {
+        synchronized (registerLock) {
+            return buildResponse(transactionId, unitId, functionCode, bank, startAddress, quantity);
+        }
+    }
+
+    /**
+     * 运行期改写一段寄存器。越界或值非法时抛出 IllegalArgumentException，不做部分写入。
+     */
+    public void writeRegisters(RegisterType registerType, int address, int[] values) {
+        if (values == null || values.length == 0) {
+            throw new IllegalArgumentException("values must not be empty");
+        }
+        int[] bank = bankOf(registerType);
+        if (address < 0 || address + values.length > bank.length) {
+            throw new IllegalArgumentException("Register range " + address + ".."
+                    + (address + values.length - 1) + " exceeds bank size " + bank.length);
+        }
+        synchronized (registerLock) {
+            for (int i = 0; i < values.length; i++) {
+                int value = values[i];
+                if (value < 0 || value > 0xFFFF) {
+                    throw new IllegalArgumentException("Register value out of range: " + value);
+                }
+                bank[address + i] = value;
+            }
+        }
+        log.info("REGISTERS_OVERRIDDEN type={} address={} count={}", registerType, address, values.length);
+    }
+
+    /** 恢复出厂寄存器映像，撤掉所有运行期改写。 */
+    public void resetRegisters() {
+        synchronized (registerLock) {
+            System.arraycopy(initialHoldingRegisters(), 0, holdingRegisters, 0, REGISTER_BANK_SIZE);
+            System.arraycopy(initialInputRegisters(), 0, inputRegisters, 0, REGISTER_BANK_SIZE);
+        }
+        log.info("REGISTERS_RESET to factory image");
+    }
+
+    /** 读取当前寄存器映像的一段，用于核对运行期改写结果。 */
+    public int[] readRegisters(RegisterType registerType, int address, int quantity) {
+        int[] bank = bankOf(registerType);
+        if (address < 0 || quantity < 1 || address + quantity > bank.length) {
+            throw new IllegalArgumentException("Register range " + address + ".."
+                    + (address + quantity - 1) + " exceeds bank size " + bank.length);
+        }
+        synchronized (registerLock) {
+            return Arrays.copyOfRange(bank, address, address + quantity);
+        }
+    }
+
+    public int bankSize() {
+        return REGISTER_BANK_SIZE;
+    }
+
+    private int[] bankOf(RegisterType registerType) {
+        return registerType == RegisterType.INPUT ? inputRegisters : holdingRegisters;
+    }
+
+    private void applyFault(FaultSpec fault, OutputStream output,
+                            int transactionId, int unitId, int functionCode,
+                            byte[] response) throws IOException {
+        log.info("FAULT_INJECT id={} type={} txn={} fc={}", fault.id(), fault.type(),
+                transactionId, functionCode);
+        switch (fault.type()) {
+            case RESPONSE_DELAY -> {
+                sleepQuietly(fault.delayMs());
+                synchronized (output) {
+                    output.write(response);
+                    output.flush();
+                }
+            }
+            case TIMEOUT -> {
+                // 吞掉请求，永不响应；客户端按超时处理。
+            }
+            case MODBUS_EXCEPTION -> sendException(output, transactionId, unitId, functionCode,
+                    fault.exceptionCode() == 0 ? 0x02 : fault.exceptionCode());
+            case CONNECTION_DROP -> throw new SocketException("Fault injected: connection dropped");
+            case FRAGMENTED_RESPONSE -> {
+                int chunkSize = fault.chunkSize() <= 0 ? 1 : fault.chunkSize();
+                synchronized (output) {
+                    for (int offset = 0; offset < response.length; offset += chunkSize) {
+                        int length = Math.min(chunkSize, response.length - offset);
+                        output.write(response, offset, length);
+                        output.flush();
+                        sleepQuietly(fault.chunkDelayMs());
+                    }
+                }
+            }
+            case COALESCED_RESPONSE -> {
+                // 同一帧复制两份、一次 flush 发出，制造“几段粘在一起”的 TCP segment。
+                synchronized (output) {
+                    output.write(response);
+                    output.write(response);
+                    output.flush();
+                }
+            }
+        }
+    }
+
+    private static void sleepQuietly(long millis) {
+        if (millis <= 0) {
+            return;
+        }
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 

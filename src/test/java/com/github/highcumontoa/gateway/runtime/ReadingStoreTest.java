@@ -105,6 +105,80 @@ class ReadingStoreTest {
         assertEquals(expectedTotal - expectedFailureTotal, snapshot.successCount());
     }
 
+    @Test
+    void tracksFaultEpisodeFromStartToRecovery() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        GatewayProperties properties = properties();
+        ReadingStore store = new ReadingStore(properties, clock);
+        store.initialize(properties.getPoints());
+
+        store.recordSuccess("temperature", 25.5d, "41CC0000", 1);
+        ReadingSnapshot healthy = store.snapshot("temperature");
+        clock.advanceSeconds(1);
+        store.recordFailure("temperature", FailureReason.TIMEOUT, "no response", "", 2);
+        ReadingSnapshot faultStart = store.snapshot("temperature");
+        clock.advanceSeconds(1);
+        store.recordFailure("temperature", FailureReason.CONNECTION_CLOSED, "socket closed", "", 3);
+        ReadingSnapshot faultOngoing = store.snapshot("temperature");
+        clock.advanceSeconds(1);
+        store.recordSuccess("temperature", 26.0d, "41D00000", 4);
+        ReadingSnapshot recovered = store.snapshot("temperature");
+
+        log.info("FAULT_EPISODE startedAt={} lastReason={} recoveredAt={} recoveryValue={} "
+                        + "basis=first failure opens episode, first success after closes it",
+                faultStart.faultStartedAt(), faultOngoing.lastFailureReason(),
+                recovered.recoveredAt(), recovered.recoveryValue());
+
+        assertNull(healthy.faultStartedAt());
+        assertEquals(true, healthy.healthy());
+
+        assertEquals(Instant.parse("2026-01-01T00:00:01Z"), faultStart.faultStartedAt());
+        assertEquals(FailureReason.TIMEOUT, faultStart.lastFailureReason());
+        assertEquals(false, faultStart.healthy());
+
+        assertEquals(Instant.parse("2026-01-01T00:00:01Z"), faultOngoing.faultStartedAt(),
+                "fault start must stay at the first failure of the episode");
+        assertEquals(FailureReason.CONNECTION_CLOSED, faultOngoing.lastFailureReason());
+        assertEquals(Instant.parse("2026-01-01T00:00:02Z"), faultOngoing.lastFailureAt());
+
+        assertEquals(Instant.parse("2026-01-01T00:00:03Z"), recovered.recoveredAt());
+        assertEquals(26.0d, recovered.recoveryValue());
+        assertEquals(FailureReason.CONNECTION_CLOSED, recovered.lastFailureReason(),
+                "last failure reason must survive recovery for post-mortem queries");
+        assertEquals(true, recovered.healthy());
+        assertEquals(2, recovered.failureCount());
+        assertEquals(2, recovered.successCount());
+        assertEquals(4, recovered.pollCount());
+    }
+
+    @Test
+    void reportsOverallHealthFromConnectionAndFaultEpisodes() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        GatewayProperties properties = properties();
+        ReadingStore store = new ReadingStore(properties, clock);
+        store.initialize(properties.getPoints());
+
+        store.recordConnected();
+        store.recordSuccess("temperature", 25.5d, "41CC0000", 1);
+        assertEquals(true, store.status().healthy());
+        assertEquals(0, store.status().pointsInFault());
+
+        store.recordFailure("temperature", FailureReason.TIMEOUT, "no response", "", 2);
+        assertEquals(false, store.status().healthy());
+        assertEquals(1, store.status().pointsInFault());
+
+        store.recordSuccess("temperature", 25.6d, "41CC0000", 3);
+        assertEquals(true, store.status().healthy());
+        assertEquals(0, store.status().pointsInFault());
+
+        store.recordDisconnected("DISCONNECTED", "connection dropped");
+        assertEquals(false, store.status().healthy(),
+                "dropped connection must mark the gateway unhealthy even without point faults");
+        log.info("HEALTH_TEST connected+good={} fault={} recovered={} disconnected={} "
+                        + "basis=healthy requires CONNECTED and zero points in fault",
+                true, false, true, false);
+    }
+
     private static GatewayProperties properties() {
         GatewayProperties properties = new GatewayProperties();
         properties.getClient().setStaleThresholdMs(2_000);

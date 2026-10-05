@@ -17,5 +17,7 @@ public record GatewayStatusSnapshot(
         Instant lastConnectedAt,
         Instant lastDisconnectedAt,
         String lastConnectionError,
-        Map<String, Long> failuresByReason) {
+        Map<String, Long> failuresByReason,
+        boolean healthy,
+        long pointsInFault) {
 }

@@ -39,7 +39,76 @@ curl http://127.0.0.1:18080/api/status
 mvn test
 ```
 
-## 2. Modbus TCP 协议映射
+## 2. 运行期故障编排（故障演练）
+
+本地数据源内置故障编排注册表，服务运行中即可注入、查询、撤销故障，无需改代码或重启。网关照常采集，故障结果按原有质量标记与失败分类对外暴露；撤销后自动恢复到正常读数。
+
+### 注入故障
+
+```bash
+curl -X POST http://127.0.0.1:18080/api/faults \
+  -H 'Content-Type: application/json' \
+  -d '{"pointName":"temperature-c","type":"TIMEOUT"}'
+```
+
+目标二选一：
+
+- `pointName`：按数据点解析寄存器区间（推荐）；
+- `registerType` + `address`（可选 `span`，默认 1）：直接按地址区间匹配。
+
+请求的寄存器区间与规则区间相交即命中。可选参数：
+
+| 字段 | 含义 | 默认 |
+|---|---|---|
+| `id` | 自定义规则 id | 自动生成 `fault-N` |
+| `delayMs` | `RESPONSE_DELAY` 的延迟毫秒 | 0 |
+| `exceptionCode` | `MODBUS_EXCEPTION` 返回的异常码 | 0x02 |
+| `chunkSize` / `chunkDelayMs` | `FRAGMENTED_RESPONSE` 分段大小与段间隔 | 1 / 0 |
+| `times` | 命中次数上限，`-1` 为不限 | -1 |
+
+支持的故障类型：
+
+| 类型 | 效果 | 网关侧表现 |
+|---|---|---|
+| `RESPONSE_DELAY` | 延迟 `delayMs` 后正常响应 | 延迟超过 `response-timeout-ms` 时记 `TIMEOUT` |
+| `TIMEOUT` | 吞掉请求永不响应 | `TIMEOUT`，随后断连重连 |
+| `MODBUS_EXCEPTION` | 返回异常功能码与异常码 | `MODBUS_EXCEPTION` |
+| `CONNECTION_DROP` | 命中时直接关闭 TCP 连接 | `CONNECTION_CLOSED`，自动重连 |
+| `FRAGMENTED_RESPONSE` | 响应拆成多段发送 | 正常解码（验证分片重组） |
+| `COALESCED_RESPONSE` | 同一帧复制两份一次发出 | 首帧正常解码，重复帧计入 `unmatchedFrames`（验证粘包拆分） |
+
+### 查询与撤销
+
+```bash
+curl http://127.0.0.1:18080/api/faults            # 列出活动故障
+curl -X DELETE http://127.0.0.1:18080/api/faults/fault-1   # 按 id 撤销
+curl -X DELETE http://127.0.0.1:18080/api/faults           # 一键全部撤销
+```
+
+撤销后网关在下个采集周期自动恢复：`quality` 回到 `GOOD`，`recoveredAt`/`recoveryValue` 记录恢复时刻与恢复后第一个有效值，`lastFailureReason` 保留供事后查询，计数不重复、不漂移。
+
+## 3. 运行期寄存器改写
+
+同一批原始寄存器内容可在运行期改写，用于不重新编译就核对各种解码约定：
+
+```bash
+# 查看当前映像（含十六进制）
+curl 'http://127.0.0.1:18080/api/device/registers?type=HOLDING&address=0&quantity=8'
+
+# 改写：向保持寄存器地址 1 起写入 0x0102 0x0304
+curl -X PUT http://127.0.0.1:18080/api/device/registers \
+  -H 'Content-Type: application/json' \
+  -d '{"registerType":"HOLDING","address":1,"values":[258,772]}'
+
+# 一键恢复出厂映像
+curl -X POST http://127.0.0.1:18080/api/device/registers/reset
+```
+
+改写立即生效于下一次采集。越界地址、越界值（>65535）、空数组返回 HTTP `400` 且不做部分写入。
+
+例如把 `0x0102 0x0304` 同时写入 `device-count`（BIG_ENDIAN+HIGH_WORD_FIRST）、`pressure-low-word-first`（LOW_WORD_FIRST）、`mixed-endian-float`（LITTLE_ENDIAN+LOW_WORD_FIRST）三个点的地址，同一组原始字节会按各自约定给出三个可区分的确定结果（16909060、float(0x03040102)、float(0x04030201)）。越界值（如让 `temperature-c` 超过 `max`）只让该点落 `OUT_OF_RANGE`，其它点不受影响。
+
+## 4. Modbus TCP 协议映射
 
 当前实现读取：
 
@@ -73,7 +142,7 @@ TCP 层使用一个读线程持续读取当前连接。读取过程基于 MBAP L
 
 无法匹配 Transaction Id 的响应不会完成任何数据点读取，会打印原始报文，并计入状态接口的 `unmatchedFrames`。
 
-## 3. 内置确定性设备
+## 5. 内置确定性设备
 
 内置设备在 `LocalModbusDeviceServer` 中实现，默认启用。寄存器映像固定，不随重启随机变化。
 
@@ -102,7 +171,7 @@ TCP 层使用一个读线程持续读取当前连接。读取过程基于 MBAP L
 - 非法地址：异常码 `0x02`
 - 非法数量：异常码 `0x03`
 
-## 4. 数据点配置与解码兼容
+## 6. 数据点配置与解码兼容
 
 配置位于 `src/main/resources/application.yml`：
 
@@ -155,7 +224,7 @@ final = raw * scale + offset
 6. 最终值落在 `[min, max]` 外时判定为 `OUT_OF_RANGE`。
 7. 解码错误、越界、类型长度不匹配不会写入错误数值；读取结果明确标记为失败。
 
-## 5. 读数质量与状态一致性
+## 7. 读数质量与状态一致性
 
 `ReadingSnapshot` 字段包括：
 
@@ -168,6 +237,15 @@ final = raw * scale + offset
 - `rawHex`：原始 Modbus 响应十六进制。
 - `cycle`：采集周期号。
 - `pollCount`、`successCount`、`failureCount`：点级计数。
+- `healthy`：点级健康判定，`quality == GOOD` 且当前不处于故障期为 `true`。
+- `faultStartedAt`：最近一次故障期开始时刻（故障期中首次失败的时间）。
+- `lastFailureReason` / `lastFailureAt`：最近一次失败原因与时刻，恢复后仍保留。
+- `recoveredAt` / `recoveryValue`：最近一次故障期结束时刻与恢复后的第一个有效值。
+
+`GatewayStatusSnapshot` 额外给出整体判定：
+
+- `healthy`：连接为 `CONNECTED` 且没有任何点处于故障期时为 `true`。
+- `pointsInFault`：当前处于故障期的点数。
 
 质量规则：
 
@@ -178,7 +256,7 @@ final = raw * scale + offset
 
 采集循环为单线程，每个周期对每个点只提交一次读取并只记录一次结果，因此不会产生重复读数、点间错位或成功/失败计数漂移。并发查询通过同步快照获得一致状态。
 
-## 6. 失败分类
+## 8. 失败分类
 
 `FailureReason` 对不同失败来源给出可区分原因：
 
@@ -202,7 +280,7 @@ final = raw * scale + offset
 
 超时或断连后，采集器会关闭不可信连接并按 `reconnect-delay-ms` 自动重连。非法、超时或不完整响应永远不会被当作有效读数。
 
-## 7. 本地验证覆盖
+## 9. 本地验证覆盖
 
 测试位于 `src/test/java`，覆盖：
 
@@ -216,7 +294,12 @@ final = raw * scale + offset
 - scale、offset、min、max；
 - 配置重复点名、非法地址、零 scale 和错误量程；
 - BAD/DEGRADED/STALE 质量标记；
-- 高并发状态更新下轮询计数、成功计数和失败计数一致性。
+- 高并发状态更新下轮询计数、成功计数和失败计数一致性；
+- 运行期故障编排：超时、设备异常、断连、分片、粘包故障的注入、分类、撤销与恢复（端到端，服务真实启动）；
+- 故障期追踪字段（`faultStartedAt`/`lastFailureReason`/`recoveredAt`/`recoveryValue`）与整体健康判定；
+- 运行期寄存器改写：同一组原始字节在四种 32 位排列、有符号/无符号约定下的可区分结果，以及复位恢复；
+- 越界改写只影响对应数据点；
+- 故障编排与寄存器改写 REST 接口的参数校验。
 
 测试日志会打印：
 
@@ -225,7 +308,7 @@ final = raw * scale + offset
 - 数据类型、scale、offset 与最终值；
 - 失败原因与判定依据。
 
-## 8. 关键配置
+## 10. 关键配置
 
 ```yaml
 gateway:

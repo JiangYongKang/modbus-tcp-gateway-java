@@ -15,5 +15,11 @@ public record ReadingSnapshot(
         Instant lastGoodAt,
         long pollCount,
         long successCount,
-        long failureCount) {
+        long failureCount,
+        boolean healthy,
+        Instant faultStartedAt,
+        FailureReason lastFailureReason,
+        Instant lastFailureAt,
+        Instant recoveredAt,
+        Double recoveryValue) {
 }

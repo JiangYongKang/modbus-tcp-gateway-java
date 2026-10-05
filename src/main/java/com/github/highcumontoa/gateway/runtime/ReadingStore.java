@@ -125,6 +125,11 @@ public class ReadingStore {
         ReadingState state = requireState(pointName);
         synchronized (state) {
             Instant now = clock.instant();
+            if (state.inFault) {
+                state.inFault = false;
+                state.recoveredAt = now;
+                state.recoveryValue = value;
+            }
             state.value = value;
             state.lastGoodValue = value;
             state.quality = PointQuality.GOOD;
@@ -146,8 +151,15 @@ public class ReadingStore {
         }
         ReadingState state = requireState(pointName);
         synchronized (state) {
+            Instant now = clock.instant();
+            if (!state.inFault) {
+                state.inFault = true;
+                state.faultStartedAt = now;
+            }
+            state.lastFailureReason = reason;
+            state.lastFailureAt = now;
             state.cycle = cycle;
-            state.updatedAt = clock.instant();
+            state.updatedAt = now;
             state.failureReason = reason;
             state.message = message == null ? "" : message;
             state.rawHex = rawHex == null ? "" : rawHex;
@@ -196,11 +208,29 @@ public class ReadingStore {
                     state.lastGoodAt,
                     state.pollCount,
                     state.successCount,
-                    state.failureCount);
+                    state.failureCount,
+                    quality == PointQuality.GOOD && !state.inFault,
+                    state.faultStartedAt,
+                    state.lastFailureReason,
+                    state.lastFailureAt,
+                    state.recoveredAt,
+                    state.recoveryValue == null ? null : state.recoveryValue);
         }
     }
 
     public GatewayStatusSnapshot status() {
+        long inFault = 0;
+        for (String pointName : pointOrder) {
+            ReadingState state = readings.get(pointName);
+            if (state == null) {
+                continue;
+            }
+            synchronized (state) {
+                if (state.inFault) {
+                    inFault++;
+                }
+            }
+        }
         synchronized (statusLock) {
             Map<String, Long> failureCounts = new LinkedHashMap<>();
             failuresByReason.forEach((reason, count) -> failureCounts.put(reason.name(), count));
@@ -218,7 +248,9 @@ public class ReadingStore {
                     lastConnectedAt,
                     lastDisconnectedAt,
                     lastConnectionError,
-                    Map.copyOf(failureCounts));
+                    Map.copyOf(failureCounts),
+                    "CONNECTED".equals(connectionState) && inFault == 0,
+                    inFault);
         }
     }
 
@@ -263,6 +295,12 @@ public class ReadingStore {
         private long pollCount;
         private long successCount;
         private long failureCount;
+        private boolean inFault;
+        private Instant faultStartedAt;
+        private FailureReason lastFailureReason;
+        private Instant lastFailureAt;
+        private Instant recoveredAt;
+        private Double recoveryValue;
 
         private ReadingState(String pointName) {
             this.pointName = pointName;

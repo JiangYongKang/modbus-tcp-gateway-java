@@ -34,10 +34,10 @@ class ReadingControllerTest {
         ReadingSnapshot reading = new ReadingSnapshot("temperature-c", 123.4d, 123.4d,
                 PointQuality.GOOD, null, "OK", "00010000000501030204D2", 1L,
                 Instant.parse("2026-01-01T00:00:00Z"), Instant.parse("2026-01-01T00:00:00Z"),
-                1L, 1L, 0L);
+                1L, 1L, 0L, true, null, null, null, null, null);
         GatewayStatusSnapshot status = new GatewayStatusSnapshot("CONNECTED", "127.0.0.1:15020",
                 1L, 1L, 1L, 0L, 0L, 0L, 0L, 0L,
-                Instant.parse("2026-01-01T00:00:00Z"), null, "", Map.of());
+                Instant.parse("2026-01-01T00:00:00Z"), null, "", Map.of(), true, 0L);
         store.readings = List.of(reading);
         store.byName.put("temperature-c", reading);
         store.status = status;

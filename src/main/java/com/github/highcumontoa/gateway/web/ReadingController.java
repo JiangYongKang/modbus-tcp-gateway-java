@@ -1,6 +1,8 @@
 package com.github.highcumontoa.gateway.web;
 
+import com.github.highcumontoa.gateway.model.GatewayHealthSnapshot;
 import com.github.highcumontoa.gateway.model.GatewayStatusSnapshot;
+import com.github.highcumontoa.gateway.model.PointHealthSnapshot;
 import com.github.highcumontoa.gateway.model.ReadingSnapshot;
 import com.github.highcumontoa.gateway.runtime.ReadingStore;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -39,5 +41,19 @@ public class ReadingController {
     @GetMapping("/status")
     public GatewayStatusSnapshot status() {
         return store.status();
+    }
+
+    @GetMapping("/readings/{pointName}/health")
+    public PointHealthSnapshot pointHealth(@PathVariable String pointName) {
+        PointHealthSnapshot snapshot = store.healthSnapshot(pointName);
+        if (snapshot == null) {
+            throw new ResponseStatusException(NOT_FOUND, "Unknown point: " + pointName);
+        }
+        return snapshot;
+    }
+
+    @GetMapping("/health")
+    public GatewayHealthSnapshot health() {
+        return store.health();
     }
 }

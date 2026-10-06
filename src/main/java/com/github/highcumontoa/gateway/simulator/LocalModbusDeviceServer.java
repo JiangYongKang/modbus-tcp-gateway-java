@@ -1,6 +1,7 @@
 package com.github.highcumontoa.gateway.simulator;
 
 import com.github.highcumontoa.gateway.config.GatewayProperties;
+import com.github.highcumontoa.gateway.model.RegisterType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
@@ -13,6 +14,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -23,6 +25,7 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
     private static final int REGISTER_BANK_SIZE = 64;
 
     private final GatewayProperties properties;
+    private final FaultOrchestrator orchestrator;
     private final int[] holdingRegisters = initialHoldingRegisters();
     private final int[] inputRegisters = initialInputRegisters();
     private final ExecutorService connectionWorkers = Executors.newCachedThreadPool(runnable -> {
@@ -34,8 +37,9 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
     private volatile Thread acceptThread;
     private volatile boolean running;
 
-    public LocalModbusDeviceServer(GatewayProperties properties) {
+    public LocalModbusDeviceServer(GatewayProperties properties, FaultOrchestrator orchestrator) {
         this.properties = properties;
+        this.orchestrator = orchestrator;
     }
 
     @Override
@@ -93,6 +97,42 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
         return 10;
     }
 
+    public void setRegister(RegisterType registerType, int address, int value) {
+        int[] bank = bankOf(registerType);
+        if (address < 0 || address >= bank.length) {
+            throw new IllegalArgumentException("Register address out of range: " + address);
+        }
+        if (value < 0 || value > 0xFFFF) {
+            throw new IllegalArgumentException("Register value out of range: " + value);
+        }
+        synchronized (bank) {
+            bank[address] = value;
+        }
+        log.warn("REGISTER_OVERRIDE registerType={} address={} value=0x{}", registerType, address,
+                Integer.toHexString(value).toUpperCase());
+    }
+
+    public void resetRegisters() {
+        synchronized (holdingRegisters) {
+            System.arraycopy(initialHoldingRegisters(), 0, holdingRegisters, 0, holdingRegisters.length);
+        }
+        synchronized (inputRegisters) {
+            System.arraycopy(initialInputRegisters(), 0, inputRegisters, 0, inputRegisters.length);
+        }
+        log.warn("REGISTER_RESET basis=restore deterministic initial register image");
+    }
+
+    public int[] snapshotRegisters(RegisterType registerType) {
+        int[] bank = bankOf(registerType);
+        synchronized (bank) {
+            return Arrays.copyOf(bank, bank.length);
+        }
+    }
+
+    private int[] bankOf(RegisterType registerType) {
+        return registerType == RegisterType.INPUT ? inputRegisters : holdingRegisters;
+    }
+
     private void acceptLoop() {
         ServerSocket current = serverSocket;
         while (running && current != null) {
@@ -117,7 +157,7 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
             InputStream input = current.getInputStream();
             OutputStream output = current.getOutputStream();
             while (!current.isClosed()) {
-                handleOneRequest(input, output);
+                handleOneRequest(current, input, output);
             }
         } catch (SocketException e) {
             log.debug("Local device connection closed: {}", e.getMessage());
@@ -126,7 +166,8 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
         }
     }
 
-    private void handleOneRequest(InputStream input, OutputStream output) throws IOException {
+    private void handleOneRequest(Socket socket, InputStream input, OutputStream output)
+            throws IOException {
         byte[] header = new byte[7];
         if (!readFully(input, header)) {
             throw new SocketException("peer closed during MBAP header");
@@ -154,12 +195,104 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
             sendException(output, transactionId, unitId, functionCode, 0x03);
             return;
         }
-        int[] bank = functionCode == 3 ? holdingRegisters : inputRegisters;
+        RegisterType registerType = functionCode == 3 ? RegisterType.HOLDING : RegisterType.INPUT;
+        int[] bank = bankOf(registerType);
         if (startAddress >= bank.length || startAddress + quantity > bank.length) {
             sendException(output, transactionId, unitId, functionCode, 0x02);
             return;
         }
 
+        Optional<FaultProfile> fault = orchestrator.matchFault(registerType, startAddress, quantity);
+        if (fault.isPresent() && applyFault(fault.get(), socket, output,
+                transactionId, unitId, functionCode, registerType, startAddress, quantity)) {
+            return;
+        }
+
+        byte[] response = buildResponse(transactionId, unitId, functionCode, bank, startAddress, quantity);
+        writeResponse(output, response, fault.orElse(null));
+    }
+
+    /**
+     * Applies a matched fault. Returns true when the normal response path must be skipped.
+     */
+    private boolean applyFault(FaultProfile fault, Socket socket, OutputStream output,
+                               int transactionId, int unitId,
+                               int functionCode, RegisterType registerType,
+                               int startAddress, int quantity) throws IOException {
+        String basis = "registerType=" + registerType + " address=[" + startAddress + ','
+                + (startAddress + quantity - 1) + "] faultId=" + fault.getId();
+        switch (fault.getType()) {
+            case LATENCY -> {
+                log.warn("FAULT_APPLY type=LATENCY delayMs={} {}", fault.getDelayMs(), basis);
+                sleepQuietly(fault.getDelayMs());
+                return false;
+            }
+            case TIMEOUT -> {
+                log.warn("FAULT_APPLY type=TIMEOUT action=swallow-request {}", basis);
+                return true;
+            }
+            case MODBUS_EXCEPTION -> {
+                log.warn("FAULT_APPLY type=MODBUS_EXCEPTION exceptionCode={} {}",
+                        fault.getExceptionCode(), basis);
+                sendException(output, transactionId, unitId, functionCode, fault.getExceptionCode());
+                return true;
+            }
+            case CONNECTION_DROP -> {
+                log.warn("FAULT_APPLY type=CONNECTION_DROP action=close-socket {}", basis);
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                }
+                return true;
+            }
+            case FRAGMENT, COALESCE -> {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private void writeResponse(OutputStream output, byte[] response,
+                               FaultProfile fault) throws IOException {
+        synchronized (output) {
+            if (fault != null && fault.getType() == FaultType.COALESCE) {
+                byte[] coalesced = new byte[response.length * 2];
+                System.arraycopy(response, 0, coalesced, 0, response.length);
+                System.arraycopy(response, 0, coalesced, response.length, response.length);
+                output.write(coalesced);
+                output.flush();
+                log.warn("FAULT_APPLY type=COALESCE action=glue-duplicate-frame frameBytes={} "
+                        + "totalBytes={} faultId={}", response.length, coalesced.length, fault.getId());
+                return;
+            }
+            if (fault != null && fault.getType() == FaultType.FRAGMENT) {
+                int chunks = Math.min(fault.getFragmentCount(), response.length);
+                int chunkSize = Math.max(1, response.length / chunks);
+                int offset = 0;
+                int index = 0;
+                while (offset < response.length) {
+                    int end = index == chunks - 1
+                            ? response.length
+                            : Math.min(response.length, offset + chunkSize);
+                    output.write(response, offset, end - offset);
+                    output.flush();
+                    log.warn("FAULT_APPLY type=FRAGMENT chunk={}/{} bytes=[{},{}) faultId={}",
+                            index + 1, chunks, offset, end, fault.getId());
+                    offset = end;
+                    index++;
+                    if (offset < response.length) {
+                        sleepQuietly(fault.getFragmentDelayMs());
+                    }
+                }
+                return;
+            }
+            output.write(response);
+            output.flush();
+        }
+    }
+
+    private byte[] buildResponse(int transactionId, int unitId, int functionCode, int[] bank,
+                                 int startAddress, int quantity) {
         int pduLength = 2 + quantity * 2;
         byte[] response = new byte[7 + pduLength];
         writeUnsignedShort(response, 0, transactionId);
@@ -168,13 +301,12 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
         response[6] = (byte) unitId;
         response[7] = (byte) functionCode;
         response[8] = (byte) (quantity * 2);
-        for (int i = 0; i < quantity; i++) {
-            writeUnsignedShort(response, 9 + i * 2, bank[startAddress + i]);
+        synchronized (bank) {
+            for (int i = 0; i < quantity; i++) {
+                writeUnsignedShort(response, 9 + i * 2, bank[startAddress + i]);
+            }
         }
-        synchronized (output) {
-            output.write(response);
-            output.flush();
-        }
+        return response;
     }
 
     private void sendException(OutputStream output, int transactionId, int unitId,
@@ -200,6 +332,14 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
             offset += count;
         }
         return true;
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(Math.max(0, millis));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static int unsignedShort(byte[] bytes, int offset) {
@@ -241,4 +381,5 @@ public class LocalModbusDeviceServer implements SmartLifecycle {
         Arrays.fill(registers, 3, REGISTER_BANK_SIZE, 0);
         return registers;
     }
+
 }

@@ -102,7 +102,93 @@ TCP 层使用一个读线程持续读取当前连接。读取过程基于 MBAP L
 - 非法地址：异常码 `0x02`
 - 非法数量：异常码 `0x03`
 
-## 4. 数据点配置与解码兼容
+## 4. 运行期故障编排（故障演练）
+
+网关运行期间可以通过 HTTP API 对内置设备下发故障编排指令，无需改代码、无需重启，网关采集循环照常运行。故障期间产生的异常读数仍按原有的质量标记（`DEGRADED`/`STALE`/`BAD`）和失败分类（`FailureReason`）对外暴露；撤销故障后采集自动恢复正常值，故障期间的旧值不会被当作当前有效状态，恢复后计数不重复、不漂移。
+
+### 注入故障
+
+```bash
+curl -X POST http://127.0.0.1:18080/api/simulator/faults \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"MODBUS_EXCEPTION","pointName":"temperature-c","exceptionCode":2}'
+```
+
+故障定位二选一：
+
+- `pointName`：按数据点注入，服务端自动解析为该点的寄存器类型与地址范围；
+- `registerType` + `addressStart`/`addressEnd`：按寄存器地址段注入（`registerType` 省略时同时匹配 HOLDING 与 INPUT）。
+
+支持的故障类型（`FaultType`）：
+
+| 类型 | 行为 | 网关侧表现 |
+|---|---|---|
+| `LATENCY` | 响应前延迟 `delayMs` 毫秒 | 延迟低于 `response-timeout-ms` 时读数保持 GOOD；超过则 `TIMEOUT` |
+| `TIMEOUT` | 吞掉请求，永不响应 | `TIMEOUT`，随后自动重连 |
+| `MODBUS_EXCEPTION` | 返回异常响应，异常码由 `exceptionCode` 指定 | `MODBUS_EXCEPTION` |
+| `CONNECTION_DROP` | 收到请求后直接断开 TCP 连接 | `CONNECTION_CLOSED`，随后自动重连 |
+| `FRAGMENT` | 把响应拆成 `fragmentCount` 段、间隔 `fragmentDelayMs` 发送 | 分片重组后仍解码为 GOOD |
+| `COALESCE` | 把同一帧的两份拷贝粘在一个 TCP 段里发出 | 第一份正常完成读取，重复帧计入 `unmatchedFrames` |
+
+### 查看与撤销
+
+```bash
+# 查看当前生效的故障
+curl http://127.0.0.1:18080/api/simulator/faults
+
+# 按 id 撤销单个故障
+curl -X DELETE http://127.0.0.1:18080/api/simulator/faults/<faultId>
+
+# 一键撤销全部故障，恢复正常采集
+curl -X DELETE http://127.0.0.1:18080/api/simulator/faults
+```
+
+非法请求（未知点名、缺少类型、地址越界等）返回 HTTP `400`；删除不存在的故障返回 `404`；本地设备未启用时编排接口返回 `503`。
+
+### 运行期改写寄存器
+
+同一批原始寄存器内容可以在运行期改写，用于拿真实报文核对各种解码约定，无需重新编译：
+
+```bash
+# 改写保持寄存器 0 为 0x01F4（temperature-c 变为 50.0）
+curl -X PUT http://127.0.0.1:18080/api/simulator/registers \
+  -H 'Content-Type: application/json' \
+  -d '[{"registerType":"HOLDING","address":0,"value":500}]'
+
+# 查看当前寄存器映像
+curl http://127.0.0.1:18080/api/simulator/registers
+
+# 恢复为初始确定性映像
+curl -X DELETE http://127.0.0.1:18080/api/simulator/registers
+```
+
+改写后解码仍完全按数据点配置的 `byte-order`/`word-order`/`data-type`/`scale`/`offset`/量程执行：同一组原始字节在不同约定下给出确定且可区分的结果；越界、类型不匹配等仍落到具体数据点上（如 `OUT_OF_RANGE`），不会悄悄写入错误数值，其它点不受影响。
+
+## 5. 故障过程与健康查询
+
+每次故障的完整过程可以通过 HTTP API 查询，注入和恢复期间查询接口保持可用，并发查询时各点计数和状态一致、不串点。
+
+```bash
+# 单个数据点的故障过程
+curl http://127.0.0.1:18080/api/readings/temperature-c/health
+
+# 网关整体健康判定
+curl http://127.0.0.1:18080/api/health
+```
+
+`PointHealthSnapshot` 字段：
+
+- `healthy`：当前无进行中的故障且质量为 `GOOD`；
+- `quality`：当前质量标记；
+- `faultActive`：是否处于未恢复的故障中；
+- `lastFaultStartedAt`：最近一次故障开始时间（首次失败的时刻，后续连续失败不会移动该时间）；
+- `lastFailureReason`：最近一次失败分类；
+- `lastRecoveredAt`：最近一次恢复时间（故障后第一次成功的时刻）；
+- `firstGoodValueAfterRecovery`：恢复后的第一个有效值。
+
+`GatewayHealthSnapshot` 字段：`healthy`（连接正常且全部数据点健康）、`connectionState`、`totalPoints`、`healthyPoints`，以及每个点的 `PointHealthSnapshot` 列表。
+
+## 6. 数据点配置与解码兼容
 
 配置位于 `src/main/resources/application.yml`：
 
@@ -155,7 +241,7 @@ final = raw * scale + offset
 6. 最终值落在 `[min, max]` 外时判定为 `OUT_OF_RANGE`。
 7. 解码错误、越界、类型长度不匹配不会写入错误数值；读取结果明确标记为失败。
 
-## 5. 读数质量与状态一致性
+## 7. 读数质量与状态一致性
 
 `ReadingSnapshot` 字段包括：
 
@@ -178,7 +264,7 @@ final = raw * scale + offset
 
 采集循环为单线程，每个周期对每个点只提交一次读取并只记录一次结果，因此不会产生重复读数、点间错位或成功/失败计数漂移。并发查询通过同步快照获得一致状态。
 
-## 6. 失败分类
+## 8. 失败分类
 
 `FailureReason` 对不同失败来源给出可区分原因：
 
@@ -202,7 +288,7 @@ final = raw * scale + offset
 
 超时或断连后，采集器会关闭不可信连接并按 `reconnect-delay-ms` 自动重连。非法、超时或不完整响应永远不会被当作有效读数。
 
-## 7. 本地验证覆盖
+## 9. 本地验证覆盖
 
 测试位于 `src/test/java`，覆盖：
 
@@ -216,7 +302,18 @@ final = raw * scale + offset
 - scale、offset、min、max；
 - 配置重复点名、非法地址、零 scale 和错误量程；
 - BAD/DEGRADED/STALE 质量标记；
-- 高并发状态更新下轮询计数、成功计数和失败计数一致性。
+- 高并发状态更新下轮询计数、成功计数和失败计数一致性；
+- 端到端故障演练（`FaultDrillEndToEndTest`，真实启动服务并通过运行期编排 API 注入/撤销故障）：
+  - `MODBUS_EXCEPTION`、`TIMEOUT`、`CONNECTION_DROP` 的失败分类与恢复后读数；
+  - `FRAGMENT` 分片响应仍解码为 GOOD，`COALESCE` 粘包重复帧计入 `unmatchedFrames`；
+  - `LATENCY` 在超时阈值内读数保持 GOOD；
+  - 运行期寄存器改写改变解码结果、复位后恢复初始值；
+  - 同一组原始字节在 BIG/LITTLE endian 与 HIGH/LOW word order 下结果确定且可区分；
+  - 越界值只落在对应数据点上，保留最后有效值，邻点不受影响；
+  - 故障期间并发查询各接口，计数不漂移、故障不串点；
+  - 非法编排请求返回 400/404；
+- 故障编排匹配规则（`FaultOrchestratorTest`）：地址段重叠、寄存器类型过滤、参数校验、撤销后恢复；
+- 故障过程跟踪（`ReadingStoreHealthTest`）：故障开始/恢复时间、恢复后首个有效值、整体健康判定。
 
 测试日志会打印：
 
@@ -225,7 +322,7 @@ final = raw * scale + offset
 - 数据类型、scale、offset 与最终值；
 - 失败原因与判定依据。
 
-## 8. 关键配置
+## 10. 关键配置
 
 ```yaml
 gateway:

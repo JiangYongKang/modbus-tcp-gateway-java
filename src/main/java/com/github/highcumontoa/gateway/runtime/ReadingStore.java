@@ -2,7 +2,9 @@ package com.github.highcumontoa.gateway.runtime;
 
 import com.github.highcumontoa.gateway.config.GatewayProperties;
 import com.github.highcumontoa.gateway.model.FailureReason;
+import com.github.highcumontoa.gateway.model.GatewayHealthSnapshot;
 import com.github.highcumontoa.gateway.model.GatewayStatusSnapshot;
+import com.github.highcumontoa.gateway.model.PointHealthSnapshot;
 import com.github.highcumontoa.gateway.model.PointQuality;
 import com.github.highcumontoa.gateway.model.ReadingSnapshot;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -125,6 +127,11 @@ public class ReadingStore {
         ReadingState state = requireState(pointName);
         synchronized (state) {
             Instant now = clock.instant();
+            if (state.faultStartedAt != null) {
+                state.lastRecoveredAt = now;
+                state.firstGoodValueAfterRecovery = value;
+                state.faultStartedAt = null;
+            }
             state.value = value;
             state.lastGoodValue = value;
             state.quality = PointQuality.GOOD;
@@ -146,9 +153,17 @@ public class ReadingStore {
         }
         ReadingState state = requireState(pointName);
         synchronized (state) {
+            Instant now = clock.instant();
+            if (state.faultStartedAt == null) {
+                state.faultStartedAt = now;
+                state.lastFaultStartedAt = now;
+                state.lastRecoveredAt = null;
+                state.firstGoodValueAfterRecovery = null;
+            }
             state.cycle = cycle;
-            state.updatedAt = clock.instant();
+            state.updatedAt = now;
             state.failureReason = reason;
+            state.lastFailureReason = reason;
             state.message = message == null ? "" : message;
             state.rawHex = rawHex == null ? "" : rawHex;
             state.value = state.lastGoodValue;
@@ -222,6 +237,41 @@ public class ReadingStore {
         }
     }
 
+    public PointHealthSnapshot healthSnapshot(String pointName) {
+        ReadingState state = readings.get(pointName);
+        if (state == null) {
+            return null;
+        }
+        synchronized (state) {
+            PointQuality quality = currentQuality(state);
+            boolean faultActive = state.faultStartedAt != null;
+            return new PointHealthSnapshot(
+                    state.pointName,
+                    !faultActive && quality == PointQuality.GOOD,
+                    quality,
+                    faultActive,
+                    state.lastFaultStartedAt,
+                    state.lastFailureReason,
+                    state.lastRecoveredAt,
+                    state.firstGoodValueAfterRecovery);
+        }
+    }
+
+    public GatewayHealthSnapshot health() {
+        List<PointHealthSnapshot> points = new ArrayList<>(pointOrder.size());
+        for (String pointName : pointOrder) {
+            points.add(healthSnapshot(pointName));
+        }
+        long healthyPoints = points.stream().filter(PointHealthSnapshot::healthy).count();
+        boolean connected;
+        synchronized (statusLock) {
+            connected = "CONNECTED".equals(connectionState);
+        }
+        boolean healthy = connected && healthyPoints == points.size();
+        return new GatewayHealthSnapshot(healthy, connected ? "CONNECTED" : connectionState,
+                points.size(), healthyPoints, List.copyOf(points));
+    }
+
     private ReadingState requireState(String pointName) {
         ReadingState state = readings.get(pointName);
         if (state == null) {
@@ -263,6 +313,11 @@ public class ReadingStore {
         private long pollCount;
         private long successCount;
         private long failureCount;
+        private Instant faultStartedAt;
+        private Instant lastFaultStartedAt;
+        private FailureReason lastFailureReason;
+        private Instant lastRecoveredAt;
+        private Double firstGoodValueAfterRecovery;
 
         private ReadingState(String pointName) {
             this.pointName = pointName;
